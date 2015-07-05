@@ -752,6 +752,7 @@ public final class View {
             sql = sql + " DESC";
         }
 
+        sql = sql + " , docs.docid " + collationStr;
         sql = sql + " LIMIT ? OFFSET ?";
         argsList.add(Integer.toString(options.getLimit()));
         argsList.add(Integer.toString(options.getSkip()));
