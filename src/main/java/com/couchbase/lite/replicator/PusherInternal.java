@@ -12,11 +12,13 @@ import com.couchbase.lite.RevisionList;
 import com.couchbase.lite.Status;
 import com.couchbase.lite.internal.InterfaceAudience;
 import com.couchbase.lite.internal.RevisionInternal;
+import com.couchbase.lite.support.CustomFuture;
 import com.couchbase.lite.support.HttpClientFactory;
 import com.couchbase.lite.support.RemoteRequest;
 import com.couchbase.lite.support.RemoteRequestCompletionBlock;
+import com.couchbase.lite.support.RevisionUtils;
+import com.couchbase.lite.util.JSONUtils;
 import com.couchbase.lite.util.Log;
-import com.couchbase.lite.util.URIUtils;
 import com.couchbase.lite.util.Utils;
 import com.couchbase.org.apache.http.entity.mime.MultipartEntity;
 import com.couchbase.org.apache.http.entity.mime.content.FileBody;
@@ -31,7 +33,6 @@ import java.net.URL;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -49,6 +50,11 @@ import java.util.concurrent.ScheduledExecutorService;
 @InterfaceAudience.Private
 public class PusherInternal extends ReplicationInternal implements Database.ChangeListener {
 
+    // Max in-memory size of buffered bulk_docs dictionary
+    private static long kMaxBulkDocsObjectSize = 5*1000*1000;
+
+    public static final int MAX_PENDING_DOCS = 200;
+
     private boolean createTarget;
     private boolean creatingTarget;
     private boolean observing;
@@ -57,12 +63,20 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
     SortedSet<Long> pendingSequences;
     Long maxPendingSequence;
 
+    private boolean paused = false;
+    private Object  pausedObj = new Object();
+
     /**
      * Constructor
+     *
      * @exclude
      */
     @InterfaceAudience.Private
-    public PusherInternal(Database db, URL remote, HttpClientFactory clientFactory, ScheduledExecutorService workExecutor, Replication.Lifecycle lifecycle, Replication parentReplication) {
+    public PusherInternal(Database db, URL remote,
+                          HttpClientFactory clientFactory,
+                          ScheduledExecutorService workExecutor,
+                          Replication.Lifecycle lifecycle,
+                          Replication parentReplication) {
         super(db, remote, clientFactory, workExecutor, lifecycle, parentReplication);
     }
 
@@ -81,7 +95,6 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
     public void setCreateTarget(boolean createTarget) {
         this.createTarget = createTarget;
     }
-
 
     protected void stopGraceful() {
 
@@ -118,14 +131,15 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
     protected Object lockWaitForPendingFutures = new Object();
 
     public void waitForPendingFutures() {
-        if(waitingForPendingFutures) {
+        if (waitingForPendingFutures) {
             return;
         }
 
         synchronized (lockWaitForPendingFutures) {
             waitingForPendingFutures = true;
 
-            Log.d(Log.TAG_SYNC, "[waitForPendingFutures()] STARTED - thread id: " + Thread.currentThread().getId());
+            Log.d(Log.TAG_SYNC, "[waitForPendingFutures()] STARTED - thread id: " +
+                    Thread.currentThread().getId());
 
             try {
 
@@ -177,50 +191,12 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
     }
 
     /**
-     * Adds a local revision to the "pending" set that are awaiting upload:
+     * - (void) maybeCreateRemoteDB in CBL_Replicator.m
      */
-    @InterfaceAudience.Private
-    private void addPending(RevisionInternal revisionInternal) {
-        long seq = revisionInternal.getSequence();
-        pendingSequences.add(seq);
-        if (seq > maxPendingSequence) {
-            maxPendingSequence = seq;
-        }
-    }
-
-    /**
-     * Removes a revision from the "pending" set after it's been uploaded. Advances checkpoint.
-     */
-    @InterfaceAudience.Private
-    private void removePending(RevisionInternal revisionInternal) {
-        long seq = revisionInternal.getSequence();
-        if (pendingSequences == null || pendingSequences.isEmpty()) {
-            Log.w(Log.TAG_SYNC, "%s: removePending() called w/ rev: %s, but pendingSequences empty",
-                    this, revisionInternal);
-            return;
-        }
-        boolean wasFirst = (seq == pendingSequences.first());
-        if (!pendingSequences.contains(seq)) {
-            Log.w(Log.TAG_SYNC, "%s: removePending: sequence %s not in set, for rev %s", this, seq, revisionInternal);
-        }
-        pendingSequences.remove(seq);
-        if (wasFirst) {
-            // If I removed the first pending sequence, can advance the checkpoint:
-            long maxCompleted;
-            if (pendingSequences.size() == 0) {
-                maxCompleted = maxPendingSequence;
-            } else {
-                maxCompleted = pendingSequences.first();
-                --maxCompleted;
-            }
-            setLastSequence(Long.toString(maxCompleted));
-        }
-    }
-
     @Override
     @InterfaceAudience.Private
-    void maybeCreateRemoteDB() {
-        if(!createTarget) {
+    protected void maybeCreateRemoteDB() {
+        if (!createTarget) {
             return;
         }
         creatingTarget = true;
@@ -231,7 +207,8 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
             @Override
             public void onCompletion(HttpResponse httpResponse, Object result, Throwable e) {
                 creatingTarget = false;
-                if(e != null && e instanceof HttpResponseException && ((HttpResponseException)e).getStatusCode() != 412) {
+                if (e != null && e instanceof HttpResponseException &&
+                        ((HttpResponseException) e).getStatusCode() != 412) {
                     Log.e(Log.TAG_SYNC, this + ": Failed to create remote db", e);
                     setError(e);
                     triggerStop();  // this is fatal: no db to push to!
@@ -246,9 +223,14 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
         pendingFutures.add(future);
     }
 
+    /**
+     * - (void) beginReplicating in CBL_Replicator.m
+     */
     @Override
     @InterfaceAudience.Private
     public void beginReplicating() {
+        // If we're still waiting to create the remote db, do nothing now. (This method will be
+        // re-invoked after that request finishes; see -maybeCreateRemoteDB above.)
 
         Log.d(Log.TAG_SYNC, "%s: beginReplicating() called", this);
 
@@ -271,8 +253,8 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
             filter = db.getFilter(filterName);
         }
         if (filterName != null && filter == null) {
-            Log.w(Log.TAG_SYNC, "%s: No ReplicationFilter registered for filter '%s'; ignoring", this, filterName);
-            ;
+            Log.w(Log.TAG_SYNC, "%s: No ReplicationFilter registered for filter '%s'; ignoring",
+                    this, filterName);
         }
 
         // Process existing changes since the last push:
@@ -286,8 +268,19 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
         RevisionList changes = db.changesSince(lastSequenceLong, options, filter, filterParams);
         if (changes.size() > 0) {
             Log.d(Log.TAG_SYNC, "%s: Queuing %d changes since %s", this, changes.size(), lastSequence);
-            batcher.queueObjects(changes);
-            batcher.flush();
+            int remaining = changes.size();
+            int size = batcher.getCapacity();
+            int start = 0;
+            while(remaining > 0){
+                if(size > remaining)
+                    size = remaining;
+                RevisionList subChanges = new RevisionList(changes.subList(start, start+size));
+                batcher.queueObjects(subChanges);
+                start += size;
+                remaining -= size;
+                pauseOrResume();
+                waitIfPaused();
+            }
         } else {
             Log.d(Log.TAG_SYNC, "%s: No changes since %s", this, lastSequence);
         }
@@ -303,10 +296,12 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
         }
     }
 
-
+    /**
+     * - (void) stopObserving in CBL_Replicator.m
+     */
     @InterfaceAudience.Private
     private void stopObserving() {
-        if(observing) {
+        if (observing) {
             observing = false;
             db.removeChangeListener(this);
         }
@@ -334,45 +329,108 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
         stopObserving();
     }
 
+
+    /**
+     * Adds a local revision to the "pending" set that are awaiting upload:
+     * - (void) addPending: (CBL_Revision*)rev in CBLRestPusher.m
+     */
+    @InterfaceAudience.Private
+    private void addPending(RevisionInternal revisionInternal) {
+        long seq = revisionInternal.getSequence();
+        pendingSequences.add(seq);
+        if (seq > maxPendingSequence) {
+            maxPendingSequence = seq;
+        }
+    }
+
+    /**
+     * Removes a revision from the "pending" set after it's been uploaded. Advances checkpoint.
+     * - (void) removePending: (CBL_Revision*)rev in CBLRestPusher.m
+     */
+    @InterfaceAudience.Private
+    private void removePending(RevisionInternal revisionInternal) {
+        long seq = revisionInternal.getSequence();
+        if (pendingSequences == null || pendingSequences.isEmpty()) {
+            Log.w(Log.TAG_SYNC, "%s: removePending() called w/ rev: %s, but pendingSequences empty",
+                    this, revisionInternal);
+            if(revisionInternal.getBody()!=null)
+                revisionInternal.getBody().release();
+            pauseOrResume();
+            return;
+        }
+        boolean wasFirst = (seq == pendingSequences.first());
+        if (!pendingSequences.contains(seq)) {
+            Log.w(Log.TAG_SYNC, "%s: removePending: sequence %s not in set, for rev %s",
+                    this, seq, revisionInternal);
+        }
+        pendingSequences.remove(seq);
+        if (wasFirst) {
+            // If I removed the first pending sequence, can advance the checkpoint:
+            long maxCompleted;
+            if (pendingSequences.size() == 0) {
+                maxCompleted = maxPendingSequence;
+            } else {
+                maxCompleted = pendingSequences.first();
+                --maxCompleted;
+            }
+            setLastSequence(Long.toString(maxCompleted));
+        }
+        if(revisionInternal.getBody()!=null)
+            revisionInternal.getBody().release();
+        pauseOrResume();
+    }
+
+    /**
+     * - (void) dbChanged: (NSNotification*)n in CBLRestPusher.m
+     */
     @Override
     @InterfaceAudience.Private
     public void changed(Database.ChangeEvent event) {
         List<DocumentChange> changes = event.getChanges();
         for (DocumentChange change : changes) {
             // Skip revisions that originally came from the database I'm syncing to:
-            URL source = change.getSourceUrl();
+            URL source = change.getSource();
             if (source != null && source.equals(remote)) {
                 return;
             }
             RevisionInternal rev = change.getAddedRevision();
             if (getLocalDatabase().runFilter(filter, filterParams, rev)) {
-                addToInbox(rev);
+                pauseOrResume();
+                waitIfPaused();
+                RevisionInternal nuRev = rev.copy();
+                nuRev.setBody(null); //save memory
+                addToInbox(nuRev);
             }
         }
     }
 
+    /**
+     * - (void) processInbox: (CBL_RevisionList*)changes in CBLRestPusher.m
+     */
     @Override
     @InterfaceAudience.Private
     protected void processInbox(final RevisionList changes) {
 
+        Log.e(Log.TAG_SYNC, "processInbox() changes="+changes.size());
+
         // Generate a set of doc/rev IDs in the JSON format that _revs_diff wants:
         // <http://wiki.apache.org/couchdb/HttpPostRevsDiff>
-        Map<String,List<String>> diffs = new HashMap<String,List<String>>();
+        Map<String, List<String>> diffs = new HashMap<String, List<String>>();
         for (RevisionInternal rev : changes) {
-            String docID = rev.getDocId();
+            String docID = rev.getDocID();
             List<String> revs = diffs.get(docID);
-            if(revs == null) {
+            if (revs == null) {
                 revs = new ArrayList<String>();
                 diffs.put(docID, revs);
             }
-            revs.add(rev.getRevId());
+            revs.add(rev.getRevID());
             addPending(rev);
         }
 
         // Call _revs_diff on the target db:
         Log.v(Log.TAG_SYNC, "%s: posting to /_revs_diff", this);
 
-        Future future = sendAsyncRequest("POST", "/_revs_diff", diffs, new RemoteRequestCompletionBlock() {
+        CustomFuture future = sendAsyncRequest("POST", "/_revs_diff", diffs, new RemoteRequestCompletionBlock() {
 
             @Override
             public void onCompletion(HttpResponse httpResponse, Object response, Throwable e) {
@@ -385,40 +443,38 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
                     if (results.size() != 0) {
                         // Go through the list of local changes again, selecting the ones the destination server
                         // said were missing and mapping them to a JSON dictionary in the form _bulk_docs wants:
-                        final List<Object> docsToSend = new ArrayList<Object>();
+                        List<Object> docsToSend = new ArrayList<Object>();
                         RevisionList revsToSend = new RevisionList();
+                        long bufferedSize = 0;
                         for (RevisionInternal rev : changes) {
                             // Is this revision in the server's 'missing' list?
                             Map<String, Object> properties = null;
-                            Map<String, Object> revResults = (Map<String, Object>) results.get(rev.getDocId());
+                            Map<String, Object> revResults = (Map<String, Object>) results.get(rev.getDocID());
                             if (revResults == null) {
                                 continue;
                             }
                             List<String> revs = (List<String>) revResults.get("missing");
-                            if (revs == null || !revs.contains(rev.getRevId())) {
+                            if (revs == null || !revs.contains(rev.getRevID())) {
                                 removePending(rev);
                                 continue;
                             }
 
-                            // Get the revision's properties:
-                            EnumSet<Database.TDContentOptions> contentOptions = EnumSet.of(
-                                    Database.TDContentOptions.TDIncludeAttachments
-                            );
-
-                            if (!dontSendMultipart && revisionBodyTransformationBlock == null) {
-                                contentOptions.add(Database.TDContentOptions.TDBigAttachmentsFollow);
-                            }
+                            // NOTE: force to load body by Database.loadRevisionBody()
+                            // In SQLiteStore.loadRevisionBody() does not load data from database
+                            // if sequence != 0 && body != null
+                            rev.setSequence(0);
+                            rev.setBody(null);
 
                             RevisionInternal loadedRev;
                             try {
-                                loadedRev = db.loadRevisionBody(rev, contentOptions);
-                                properties = new HashMap<String, Object>(rev.getProperties());
+                                loadedRev = db.loadRevisionBody(rev);
                             } catch (CouchbaseLiteException e1) {
                                 Log.w(Log.TAG_SYNC, "%s Couldn't get local contents of %s", rev, PusherInternal.this);
                                 continue;
                             }
 
                             RevisionInternal populatedRev = transformRevision(loadedRev);
+                            loadedRev = null;
 
                             List<String> possibleAncestors = (List<String>) revResults.get("possible_ancestors");
 
@@ -432,10 +488,13 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
                                 // Look for the latest common ancestor and stub out older attachments:
                                 int minRevPos = findCommonAncestor(populatedRev, possibleAncestors);
 
-                                Database.stubOutAttachmentsInRevBeforeRevPos(populatedRev, minRevPos + 1, false);
+                                Status status = new Status(Status.OK);
+                                if (!db.expandAttachments(populatedRev, minRevPos + 1, !dontSendMultipart, false, status)) {
+                                    Log.w(Log.TAG_SYNC, "%s: Couldn't expand attachments of %s", this, populatedRev);
+                                    continue;
+                                }
 
                                 properties = populatedRev.getProperties();
-
                                 if (!dontSendMultipart && uploadMultipartRevision(populatedRev)) {
                                     continue;
                                 }
@@ -448,17 +507,13 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
                             revsToSend.add(rev);
                             docsToSend.add(properties);
 
-                            //TODO: port this code from iOS
-                                /*
-                                bufferedSize += [CBLJSON estimateMemorySize: properties];
-                                if (bufferedSize > kMaxBulkDocsObjectSize) {
-                                    [self uploadBulkDocs: docsToSend changes: revsToSend];
-                                    docsToSend = $marray();
-                                    revsToSend = [[CBL_RevisionList alloc] init];
-                                    bufferedSize = 0;
-                                }
-                                */
-
+                            bufferedSize += JSONUtils.estimate(properties);
+                            if (bufferedSize > kMaxBulkDocsObjectSize) {
+                                uploadBulkDocs(docsToSend, revsToSend);
+                                docsToSend = new ArrayList<Object>();
+                                revsToSend = new RevisionList();
+                                bufferedSize = 0;
+                            }
                         }
 
                         // Post the revisions to the destination:
@@ -474,30 +529,35 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
             }
 
         });
+        future.setQueue(pendingFutures);
         pendingFutures.add(future);
 
+        pauseOrResume();
     }
 
     /**
      * Post the revisions to the destination. "new_edits":false means that the server should
      * use the given _rev IDs instead of making up new ones.
+     *
+     * - (void) uploadBulkDocs: (NSArray*)docsToSend changes: (CBL_RevisionList*)changes
+     * in CBLRestPusher.m
      */
     @InterfaceAudience.Private
     protected void uploadBulkDocs(List<Object> docsToSend, final RevisionList changes) {
 
         final int numDocsToSend = docsToSend.size();
-        if (numDocsToSend == 0 ) {
+        if (numDocsToSend == 0) {
             return;
         }
 
         Log.v(Log.TAG_SYNC, "%s: POSTing " + numDocsToSend + " revisions to _bulk_docs: %s", PusherInternal.this, docsToSend);
         addToChangesCount(numDocsToSend);
 
-        Map<String,Object> bulkDocsBody = new HashMap<String,Object>();
+        Map<String, Object> bulkDocsBody = new HashMap<String, Object>();
         bulkDocsBody.put("docs", docsToSend);
         bulkDocsBody.put("new_edits", false);
 
-        Future future = sendAsyncRequest("POST", "/_bulk_docs", bulkDocsBody, new RemoteRequestCompletionBlock() {
+        CustomFuture future = sendAsyncRequest("POST", "/_bulk_docs", bulkDocsBody, new RemoteRequestCompletionBlock() {
 
             @Override
             public void onCompletion(HttpResponse httpResponse, Object result, Throwable e) {
@@ -525,11 +585,10 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
 
                     // Remove from the pending list all the revs that didn't fail:
                     for (RevisionInternal revisionInternal : changes) {
-                        if (!failedIDs.contains(revisionInternal.getDocId())) {
+                        if (!failedIDs.contains(revisionInternal.getDocID())) {
                             removePending(revisionInternal);
                         }
                     }
-
                 }
                 if (e != null) {
                     setError(e);
@@ -537,11 +596,10 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
                     Log.v(Log.TAG_SYNC, "%s: POSTed to _bulk_docs", PusherInternal.this);
                 }
                 addToCompletedChangesCount(numDocsToSend);
-
             }
         });
+        future.setQueue(pendingFutures);
         pendingFutures.add(future);
-
     }
 
     /**
@@ -555,16 +613,6 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
 
         Map<String, Object> revProps = revision.getProperties();
 
-        // TODO: refactor this to
-        /*
-            // Get the revision's properties:
-            NSError* error;
-            if (![_db inlineFollowingAttachmentsIn: rev error: &error]) {
-                self.error = error;
-                [self revisionFailed];
-                return;
-            }
-         */
         Map<String, Object> attachments = (Map<String, Object>) revProps.get("_attachments");
         for (String attachmentKey : attachments.keySet()) {
             Map<String, Object> attachment = (Map<String, Object>) attachments.get(attachmentKey);
@@ -575,15 +623,15 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
                     multiPart = new MultipartEntity();
 
                     try {
-                        String json  = Manager.getObjectMapper().writeValueAsString(revProps);
+                        String json = Manager.getObjectMapper().writeValueAsString(revProps);
                         Charset utf8charset = Charset.forName("UTF-8");
                         byte[] uncompressed = json.getBytes(utf8charset);
                         byte[] compressed = null;
                         byte[] data = uncompressed;
                         String contentEncoding = null;
-                        if(uncompressed.length > RemoteRequest.MIN_JSON_LENGTH_TO_COMPRESS && canSendCompressedRequests()){
+                        if (uncompressed.length > RemoteRequest.MIN_JSON_LENGTH_TO_COMPRESS && canSendCompressedRequests()) {
                             compressed = Utils.compressByGzip(uncompressed);
-                            if(compressed.length < uncompressed.length){
+                            if (compressed.length < uncompressed.length) {
                                 data = compressed;
                                 contentEncoding = "gzip";
                             }
@@ -595,10 +643,10 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
                     }
                 }
 
-                BlobStore blobStore = this.db.getAttachments();
+                BlobStore blobStore = this.db.getAttachmentStore();
                 String base64Digest = (String) attachment.get("digest");
                 BlobKey blobKey = new BlobKey(base64Digest);
-                String path = blobStore.pathForKey(blobKey);
+                String path = blobStore.getRawPathForKey(blobKey);
                 File file = new File(path);
                 if (!file.exists()) {
                     Log.w(Log.TAG_SYNC, "Unable to find blob file for blobKey: %s - Skipping upload of multipart revision.", blobKey);
@@ -607,18 +655,24 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
                     String contentType = null;
                     if (attachment.containsKey("content_type")) {
                         contentType = (String) attachment.get("content_type");
+                    } else if (attachment.containsKey("type")) {
+                        contentType = (String) attachment.get("type");
                     } else if (attachment.containsKey("content-type")) {
                         Log.w(Log.TAG_SYNC, "Found attachment that uses content-type" +
                                 " field name instead of content_type (see couchbase-lite-android" +
                                 " issue #80): %s", attachment);
                     }
 
+                    // contentType = null causes Exception from FileBody of apache.
+                    if(contentType == null)
+                        contentType = "application/octet-stream"; // default
+
                     // NOTE: Content-Encoding might not be necessary to set. Apache FileBody does not set Content-Encoding.
                     //       FileBody always return null for getContentEncoding(), and Content-Encoding header is not set in multipart
                     // CBL iOS: https://github.com/couchbase/couchbase-lite-ios/blob/feb7ff5eda1e80bd00e5eb19f1d46c793f7a1951/Source/CBL_Pusher.m#L449-L452
                     String contentEncoding = null;
-                    if(attachment.containsKey("encoding")){
-                        contentEncoding = (String)attachment.get("encoding");
+                    if (attachment.containsKey("encoding")) {
+                        contentEncoding = (String) attachment.get("encoding");
                     }
 
                     FileBody fileBody = new CustomFileBody(file, attachmentKey, contentType, contentEncoding);
@@ -632,18 +686,18 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
             return false;
         }
 
-        final String path = String.format("/%s?new_edits=false", encodeDocumentId(revision.getDocId()));
+        final String path = String.format("/%s?new_edits=false", encodeDocumentId(revision.getDocID()));
 
         Log.d(Log.TAG_SYNC, "Uploading multipart request.  Revision: %s", revision);
 
         addToChangesCount(1);
 
-        Future future = sendAsyncMultipartRequest("PUT", path, multiPart, new RemoteRequestCompletionBlock() {
+        CustomFuture future = sendAsyncMultipartRequest("PUT", path, multiPart, new RemoteRequestCompletionBlock() {
             @Override
             public void onCompletion(HttpResponse httpResponse, Object result, Throwable e) {
                 try {
-                    if(e != null) {
-                        if(e instanceof HttpResponseException) {
+                    if (e != null) {
+                        if (e instanceof HttpResponseException) {
                             // Server doesn't like multipart, eh? Fall back to JSON.
                             if (((HttpResponseException) e).getStatusCode() == 415) {
                                 //status 415 = "bad_content_type"
@@ -663,17 +717,19 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
                     addToCompletedChangesCount(1);
 
                 }
-
             }
         });
+        future.setQueue(pendingFutures);
         pendingFutures.add(future);
 
         return true;
-
     }
 
-    // Fallback to upload a revision if uploadMultipartRevision failed due to the server's rejecting
-    // multipart format.
+    /**
+     * Fallback to upload a revision if uploadMultipartRevision failed due to the server's rejecting
+     * multipart format.
+     * - (void) uploadJSONRevision: (CBL_Revision*)originalRev in CBLRestPusher.m
+     */
     private void uploadJsonRevision(final RevisionInternal rev) {
         // Get the revision's properties:
         if (!db.inlineFollowingAttachmentsIn(rev)) {
@@ -681,8 +737,8 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
             return;
         }
 
-        final String path = String.format("/%s?new_edits=false", encodeDocumentId(rev.getDocId()));
-        Future future = sendAsyncRequest("PUT",
+        final String path = String.format("/%s?new_edits=false", encodeDocumentId(rev.getDocID()));
+        CustomFuture future = sendAsyncRequest("PUT",
                 path,
                 rev.getProperties(),
                 new RemoteRequestCompletionBlock() {
@@ -695,11 +751,16 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
                         }
                     }
                 });
+        future.setQueue(pendingFutures);
         pendingFutures.add(future);
     }
 
-    // Given a revision and an array of revIDs, finds the latest common ancestor revID
-    // and returns its generation #. If there is none, returns 0.
+    /**
+     * Given a revision and an array of revIDs, finds the latest common ancestor revID
+     * and returns its generation #. If there is none, returns 0.
+     *
+     * int CBLFindCommonAncestor(CBL_Revision* rev, NSArray* possibleRevIDs) in CBLRestPusher.m
+     */
     private static int findCommonAncestor(RevisionInternal rev, List<String> possibleRevIDs) {
         if (possibleRevIDs == null || possibleRevIDs.size() == 0) {
             return 0;
@@ -707,7 +768,7 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
         List<String> history = Database.parseCouchDBRevisionHistory(rev.getProperties());
 
         //rev is missing _revisions property
-        assert(history != null);
+        assert (history != null);
 
         boolean changed = history.retainAll(possibleRevIDs);
         String ancestorID = history.size() == 0 ? null : history.get(0);
@@ -716,7 +777,7 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
             return 0;
         }
 
-        int generation = Database.parseRevIDNumber(ancestorID);
+        int generation = RevisionUtils.parseRevIDNumber(ancestorID);
 
         return generation;
     }
@@ -733,6 +794,34 @@ public class PusherInternal extends ReplicationInternal implements Database.Chan
         @Override
         public String getContentEncoding() {
             return contentEncoding;
+        }
+    }
+
+
+    private void pauseOrResume() {
+        int pending = batcher.count() + pendingSequences.size();
+        setPaused(pending >= MAX_PENDING_DOCS);
+    }
+
+    private void setPaused(boolean paused) {
+        Log.v(Log.TAG, "setPaused: " + paused);
+        synchronized (pausedObj) {
+            if(this.paused != paused) {
+                this.paused = paused;
+                pausedObj.notifyAll();
+            }
+        }
+    }
+
+    private void waitIfPaused(){
+        while (paused) {
+            Log.v(Log.TAG, "Waiting: " + paused);
+            synchronized (pausedObj) {
+                try {
+                    pausedObj.wait();
+                } catch (InterruptedException e) {
+                }
+            }
         }
     }
 }
