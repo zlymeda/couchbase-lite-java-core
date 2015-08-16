@@ -2,7 +2,7 @@ apply plugin: 'java'
 apply plugin: 'maven'
 apply plugin: 'eclipse'
 
-version = System.getenv("MAVEN_UPLOAD_VERSION")
+version = "1.1.0.3"
 
 sourceCompatibility = 1.6
 
@@ -52,11 +52,9 @@ task uploadArchivesWrapper(dependsOn: createMavenDirectory) << {
 uploadArchives {
     repositories {
         mavenDeployer {
-            repository(url: System.getenv("MAVEN_UPLOAD_REPO_URL")) {
-                authentication(userName: System.getenv("MAVEN_UPLOAD_USERNAME"), password: System.getenv("MAVEN_UPLOAD_PASSWORD"))
-            }
+            repository(url: "file://d:/hack/.github/maven-repository/")
             pom.version = version
-            pom.groupId = 'com.couchbase.lite'
+            pom.groupId = 'zlymeda'
             pom.artifactId = 'couchbase-lite-java-core'
             pom.project {
                 licenses {
