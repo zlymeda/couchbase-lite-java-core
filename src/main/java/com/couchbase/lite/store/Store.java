@@ -55,7 +55,7 @@ public interface Store {
      * @return true on success, false on failure.
      */
     //boolean open(String directory, boolean readOnly, Manager manager);
-    boolean open();
+    boolean open() throws CouchbaseLiteException;
 
     /**
      * Closes storage before it's deallocated.
@@ -355,8 +355,6 @@ public interface Store {
      * @return The new revision, with revID filled in, or nil on error.
      * @throws CouchbaseLiteException
      */
-    //RevisionInternal putLocalRevision(RevisionInternal revision, String prevRevID, boolean obeyMVCC)
-    // throws CouchbaseLiteException;
-    RevisionInternal putLocalRevision(RevisionInternal revision, String prevRevID)
+    RevisionInternal putLocalRevision(RevisionInternal revision, String prevRevID, boolean obeyMVCC)
             throws CouchbaseLiteException;
 }

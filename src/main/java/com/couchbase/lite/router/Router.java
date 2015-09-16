@@ -275,7 +275,14 @@ public class Router implements Database.ChangeListener, Database.DatabaseListene
         if (!db.exists()) {
             return new Status(Status.NOT_FOUND);
         }
-        if (!db.open()) {
+
+        boolean isOpen = false;
+        try {
+            isOpen = db.open();
+        } catch (CouchbaseLiteException e) {
+            return e.getCBLStatus();
+        }
+        if (!isOpen) {
             return new Status(Status.INTERNAL_SERVER_ERROR);
         }
         return new Status(Status.OK);
@@ -990,7 +997,15 @@ public class Router implements Database.ChangeListener, Database.DatabaseListene
         if (db.exists()) {
             return new Status(Status.DUPLICATE);
         }
-        if (!db.open()) {
+
+        boolean isOpen = false;
+        try {
+            isOpen = db.open();
+        } catch (CouchbaseLiteException e) {
+            return e.getCBLStatus();
+        }
+
+        if (!isOpen) {
             return new Status(Status.INTERNAL_SERVER_ERROR);
         }
         setResponseLocation(connection.getURL());
@@ -1624,7 +1639,7 @@ public class Router implements Database.ChangeListener, Database.DatabaseListene
                 List<Map<String, Object>> result = null;
                 if (openRevsParam.equals("all")) {
                     // Get all conflicting revisions:
-                    RevisionList allRevs = db.getAllRevisions(docID, true);
+                    RevisionList allRevs = db.getStore().getAllRevisions(docID, true);
                     result = new ArrayList<Map<String, Object>>(allRevs.size());
                     for (RevisionInternal rev : allRevs) {
 
@@ -1962,8 +1977,8 @@ public class Router implements Database.ChangeListener, Database.DatabaseListene
             StreamUtils.copyStream(contentStream, dataStream);
             body.appendData(dataStream.toByteArray());
             body.finish();
-        } catch (IOException e) {
-            throw new CouchbaseLiteException(Status.BAD_ATTACHMENT);
+        } catch (Exception e) {
+            throw new CouchbaseLiteException(e.getCause(), Status.BAD_ATTACHMENT);
         }
 
         RevisionInternal rev = db.updateAttachment(attachment, body, connection.getRequestProperty("content-type"), AttachmentInternal.AttachmentEncoding.AttachmentEncodingNone,

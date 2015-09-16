@@ -8,6 +8,8 @@ import com.couchbase.lite.replicator.Replication;
 import com.couchbase.lite.support.FileDirUtils;
 import com.couchbase.lite.support.HttpClientFactory;
 import com.couchbase.lite.support.Version;
+import com.couchbase.lite.support.security.SymmetricKey;
+import com.couchbase.lite.support.security.SymmetricKeyException;
 import com.couchbase.lite.util.Log;
 import com.couchbase.lite.util.StreamUtils;
 import com.couchbase.lite.util.Utils;
@@ -42,8 +44,8 @@ import java.util.regex.Pattern;
  */
 public final class Manager {
 
-    protected static final String kV1DBExtension = ".cblite"; // Couchbase Lite 1.0
-    protected static final String kDBExtension = ".cblite2";
+    protected static final String kV1DBExtension = ".cblite";  // Couchbase Lite 1.0
+    protected static final String kDBExtension   = ".cblite2"; // Couchbase Lite 1.2 or later (for iOS 1.1 or later)
     protected static final String DEFAULT_STORE_CLASSNAME = "com.couchbase.lite.store.SQLiteStore";
 
     public static final ManagerOptions DEFAULT_OPTIONS = new ManagerOptions();
@@ -55,6 +57,7 @@ public final class Manager {
     private ManagerOptions options;
     private File directoryFile;
     private Map<String, Database> databases;
+    private Map<String, SymmetricKey> encryptionKeys;
     private List<Replication> replications;
     private ScheduledExecutorService workExecutor;
     private HttpClientFactory defaultHttpClientFactory;
@@ -91,12 +94,13 @@ public final class Manager {
     @InterfaceAudience.Public
     public Manager(Context context, ManagerOptions options) throws IOException {
 
-        Log.i(Database.TAG, "Starting Manager version: %s", Manager.VERSION);
+        Log.d(Database.TAG, "Starting Manager version: %s", Manager.VERSION);
 
         this.context = context;
         this.directoryFile = context.getFilesDir();
         this.options = (options != null) ? options : DEFAULT_OPTIONS;
         this.databases = new HashMap<String, Database>();
+        this.encryptionKeys = new HashMap<String, SymmetricKey>();
         this.replications = new ArrayList<Replication>();
         this.storeClassName = options.getStoreClassName() != null ?
                 options.getStoreClassName() : DEFAULT_STORE_CLASSNAME;
@@ -221,7 +225,7 @@ public final class Manager {
      */
     @InterfaceAudience.Public
     public void close() {
-        Log.i(Database.TAG, "Closing " + this);
+        Log.d(Database.TAG, "Closing " + this);
         for (Database database : databases.values()) {
             // Database.close() closes all active replicators
             database.close();
@@ -234,7 +238,7 @@ public final class Manager {
             Utils.shutdownAndAwaitTermination(workExecutor);
         }
 
-        Log.i(Database.TAG, "Closed " + this);
+        Log.d(Database.TAG, "Closed " + this);
     }
 
     /**
@@ -271,11 +275,68 @@ public final class Manager {
     }
 
     /**
+     * Registers an encryption key for a database. This must be called before opening an encrypted
+     * database, or before creating a database that's to be encrypted. If the key is incorrect
+     * (or no key is given for an encrypted database), the subsequent call
+     * to open the database will fail.
+     * @param key           The encryption key.
+     * @param databaseName  The name of the database.
+     * @return
+     */
+    @InterfaceAudience.Public
+    public boolean registerEncryptionKey(byte[] key, String databaseName) {
+        if (databaseName == null)
+            return false;
+
+        if (key != null) {
+            try {
+                SymmetricKey realKey = new SymmetricKey(key);
+                encryptionKeys.put(databaseName, realKey);
+            } catch (SymmetricKeyException e) {
+                Log.e(Database.TAG, "Cannot create a symmetric key", e);
+                return false;
+            }
+        } else
+            encryptionKeys.remove(databaseName);
+        return true;
+    }
+
+    /**
+     * Registers an encryption key with a password for a database. This must be called before
+     * opening an encrypted database, or before creating a database that's to be encrypted.
+     * If the key is incorrect (or no key is given for an encrypted database), the subsequent call
+     * to open the database will fail.
+     * @param password      The encryption password.
+     * @param databaseName  The name of the database.
+     * @return
+     */
+    @InterfaceAudience.Public
+    public boolean registerEncryptionKey(String password, String databaseName) {
+        if (databaseName == null)
+            return false;
+
+        if (password != null) {
+            try {
+                SymmetricKey realKey = new SymmetricKey(password);
+                encryptionKeys.put(databaseName, realKey);
+            } catch (SymmetricKeyException e) {
+                Log.e(Database.TAG, "Cannot create a symmetric key", e);
+                return false;
+            }
+        } else
+            encryptionKeys.remove(databaseName);
+        return true;
+    }
+
+    /**
      * Replaces or installs a database from a file.
      * <p/>
-     * This is primarily used to install a canned database on first launch of an app, in which case
-     * you should first check .exists to avoid replacing the database if it exists already. The
-     * canned database would have been copied into your app bundle at build time.
+     * This is primarily used to install a canned database
+     * on first launch of an app, in which case you should first check .exists to avoid replacing the
+     * database if it exists already. The canned database would have been copied into your app bundle
+     * at build time. This property is deprecated for the new .cblite2 database file. If the database
+     * file is a directory and has the .cblite2 extension,
+     * use -replaceDatabaseNamed:withDatabaseDir:error: instead.
      *
      * @param databaseName      The name of the target Database to replace or create.
      * @param databaseStream    InputStream on the source Database file.
@@ -292,6 +353,79 @@ public final class Manager {
             throws CouchbaseLiteException {
         replaceDatabase(databaseName, databaseStream,
                 attachmentStreams == null ? null : attachmentStreams.entrySet().iterator());
+    }
+
+    /**
+     * Replaces or installs a database from a file.
+     *
+     * This is primarily used to install a canned database
+     * on first launch of an app, in which case you should first check .exists to avoid replacing the
+     * database if it exists already. The canned database would have been copied into your app bundle
+     * at build time. If the database file is not a directory and has the .cblite extension,
+     * use -replaceDatabaseNamed:withDatabaseFile:withAttachments:error: instead.
+     *
+     * @param databaseName The name of the database to replace.
+     * @param databaseDir Path of the database directory that should replace it.
+     * @return YES if the database was copied, NO if an error occurred.
+     */
+    @InterfaceAudience.Public
+    public boolean replaceDatabase(String databaseName, String databaseDir) {
+        Database db = getDatabase(databaseName, false);
+        if(db == null)
+            return false;
+
+        File dir = new File(databaseDir);
+        if(!dir.exists()){
+            Log.w(Database.TAG, "Database file doesn't exist at path : %s", databaseDir);
+            return false;
+        }
+        if (!dir.isDirectory()) {
+            Log.w(Database.TAG, "Database file is not a directory. " +
+                    "Use -replaceDatabaseNamed:withDatabaseFilewithAttachments:error: instead.");
+            return false;
+        }
+
+        File destDir = new File(db.getPath());
+        File srcDir = new File(databaseDir);
+        if(destDir.exists()) {
+            if (!FileDirUtils.deleteRecursive(destDir)) {
+                Log.w(Database.TAG, "Failed to delete file/directly: " + destDir);
+                return false;
+            }
+        }
+        try {
+            FileDirUtils.copyFolder(srcDir, destDir);
+        } catch (IOException e) {
+            Log.w(Database.TAG, "Failed to copy directly from " + srcDir + " to " + destDir, e);
+            return false;
+        }
+
+        boolean isOpen = false;
+        CouchbaseLiteException error = null;
+        try {
+            isOpen = db.open();
+        } catch (CouchbaseLiteException e) {
+            error = e;
+        }
+
+        if (!isOpen) {
+            Log.w(Database.TAG, "Failed to open database", error);
+            return false;
+        }
+
+        /* TODO: Currently Java implementation is different from iOS, needs to catch up.
+        if(!db.saveLocalUUIDInLocalCheckpointDocument()){
+            Log.w(Database.TAG, "Failed to replace UUIDs");
+            return false;
+        }
+        */
+
+        if(!db.replaceUUIDs()){
+            Log.w(Database.TAG, "Failed to replace UUIDs");
+            return false;
+        }
+
+        return true;
     }
 
     ///////////////////////////////////////////////////////////////////////////
@@ -332,6 +466,22 @@ public final class Manager {
     @InterfaceAudience.Private
     public Collection<Database> allOpenDatabases() {
         return databases.values();
+    }
+
+    /**
+     * @exclude
+     */
+    @InterfaceAudience.Private
+    public boolean isEnableStorageEncryption() {
+        return options.isEnableStorageEncryption();
+    }
+
+    /**
+     * @exclude
+     */
+    @InterfaceAudience.Private
+    public Map<String, SymmetricKey> getEncryptionKeys() {
+        return Collections.unmodifiableMap(encryptionKeys) ;
     }
 
     /**
@@ -726,7 +876,6 @@ public final class Manager {
      */
     @InterfaceAudience.Private
     protected void forgetDatabase(Database db) {
-
         // remove from cached list of dbs
         databases.remove(db.getName());
 
@@ -739,6 +888,9 @@ public final class Manager {
                 replicationIterator.remove();
             }
         }
+
+        // Remove registered encryption key if available:
+        encryptionKeys.remove(db.getName());
     }
 
     /**
@@ -757,5 +909,9 @@ public final class Manager {
     @InterfaceAudience.Private
     private static boolean isWindows() {
         return (OS.indexOf("win") >= 0);
+    }
+
+    protected String getStoreClassName() {
+        return storeClassName;
     }
 }

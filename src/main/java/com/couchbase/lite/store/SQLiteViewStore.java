@@ -23,8 +23,10 @@ import com.couchbase.lite.storage.Cursor;
 import com.couchbase.lite.storage.SQLException;
 import com.couchbase.lite.storage.SQLiteStorageEngine;
 import com.couchbase.lite.support.JsonDocument;
+import com.couchbase.lite.util.CountDown;
 import com.couchbase.lite.util.Log;
 import com.couchbase.lite.util.SQLiteUtils;
+import com.fasterxml.jackson.core.JsonProcessingException;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -59,11 +61,14 @@ public class SQLiteViewStore implements ViewStore, QueryRowStore {
     // Constructor
     ///////////////////////////////////////////////////////////////////////////
 
-    protected SQLiteViewStore(SQLiteStore store, String name, boolean create) {
+    protected SQLiteViewStore(SQLiteStore store, String name, boolean create) throws CouchbaseLiteException{
         this.store = store;
         this.name = name;
         this.viewID = -1; // means 'unknown'
         this.collation = View.TDViewCollation.TDViewCollationUnicode;
+
+        if(!create && getViewID() <= 0)
+            throw new CouchbaseLiteException(Status.NOT_FOUND);
     }
 
     ///////////////////////////////////////////////////////////////////////////
@@ -104,7 +109,7 @@ public class SQLiteViewStore implements ViewStore, QueryRowStore {
         String sql = "DROP TABLE IF EXISTS 'maps_#'; " +
                 "UPDATE views SET lastSequence=0, total_docs=0 WHERE view_id=#";
         if (!runStatements(sql))
-            Log.w(TAG, "Couldn't delete view index `%s`", name);
+            Log.w(TAG, "Couldn't delete view _index `%s`", name);
     }
 
     @Override
@@ -123,7 +128,7 @@ public class SQLiteViewStore implements ViewStore, QueryRowStore {
 
     /**
      * Updates the version of the view. A change in version means the delegate's map block has
-     * changed its semantics, so the index should be deleted.
+     * changed its semantics, so the _index should be deleted.
      */
     @Override
     public boolean setVersion(String version) {
@@ -218,7 +223,7 @@ public class SQLiteViewStore implements ViewStore, QueryRowStore {
     }
 
     /**
-     * Updates the view's index (incrementally) if necessary.
+     * Updates the view's _index (incrementally) if necessary.
      *
      * @return 200 if updated, 304 if already up-to-date, else an error code
      */
@@ -303,7 +308,7 @@ public class SQLiteViewStore implements ViewStore, QueryRowStore {
 
             // NOTE: Below is original Query. In case query result uses a lot of memory,
             //       Android SQLiteDatabase causes null value column. Then it causes the missing
-            //       index data because following logic skip result if column is null.
+            //       _index data because following logic skip result if column is null.
             //       To avoid the issue, retrieving json field is isolated from original query.
             //       Because json field could be large, maximum size is 2MB.
             // StringBuffer sql = new StringBuffer( "SELECT revs.doc_id, sequence, docid, revid,
@@ -398,7 +403,6 @@ public class SQLiteViewStore implements ViewStore, QueryRowStore {
                 byte[] json = SQLiteUtils.byteArrayResultForQuery(store.getStorageEngine(),
                         "SELECT json FROM revs WHERE sequence=?", selectArgs3);
 
-                Log.e("json", "<" + new String(json) + ">");
                 // Get the document properties, to pass to the map function:
                 Map<String, Object> properties = store.documentPropertiesFromJSON(
                         json,
@@ -457,18 +461,21 @@ public class SQLiteViewStore implements ViewStore, QueryRowStore {
 
         final Predicate<QueryRow> postFilter = options.getPostFilter();
 
-        // TODO
-        // int limit = QueryOptions.QUERY_OPTIONS_DEFAULT_LIMIT;
-        // int skip = 0;
+        int tmpLimit = QueryOptions.QUERY_OPTIONS_DEFAULT_LIMIT;
+        int tmpSkip = 0;
         if (postFilter != null) {
             // #574: Custom post-filter means skip/limit apply to the filtered rows, not to the
             // underlying query, so handle them specially:
-            // TODO
-            //limit = options.getLimit();
-            //skip = options.getSkip();
+            tmpLimit = options.getLimit();
+            tmpSkip = options.getSkip();
+            if(tmpLimit == 0)
+                return new ArrayList<QueryRow>(); // empty result set
             options.setLimit(QueryOptions.QUERY_OPTIONS_DEFAULT_LIMIT);
             options.setSkip(0);
         }
+
+        final CountDown skip = new CountDown(tmpSkip);
+        final CountDown limit = new CountDown(tmpLimit);
 
         final List<QueryRow> rows = new ArrayList<QueryRow>();
 
@@ -505,26 +512,8 @@ public class SQLiteViewStore implements ViewStore, QueryRowStore {
                                 sequence, // sequence
                                 properties// properties
                         );
-                        /*
-                        String revID = cursor.getString(4);
-                        byte[] json = cursor.getBlob(5);
-                        docRevision = store.revision(
-                                docID,    // docID
-                                revID,    // revID
-                                false,    // deleted
-                                sequence, // sequence
-                                json      // json
-                        );
-                        */
                     }
                 }
-                /*
-                Log.v(TAG, "Query %s: Found row with key=%s, value=%s, id=%s",
-                        name,
-                        new String(keyData),
-                        new String(valueData),
-                        docID);
-                */
                 QueryRow row = new QueryRow(docID, sequence,
                         keyDoc.jsonObject(), valueDoc.jsonObject(),
                         docRevision, SQLiteViewStore.this);
@@ -532,26 +521,50 @@ public class SQLiteViewStore implements ViewStore, QueryRowStore {
                     if (!postFilter.apply(row)) {
                         return new Status(Status.OK);
                     }
-                    /* TODO
-                    if(skip > 0){
-                        skip--;
+                    if(skip.getCount() > 0){
+                        skip.countDown();
                         return new Status(Status.OK);
                     }
-                    */
 
                 }
                 rows.add(row);
 
-                /* TODO
-                if(limit-- == 0)
+                if(limit.countDown() == 0)
                     return new Status(0); /// stops the iteration
-                */
                 return new Status(Status.OK);
             }
         });
 
         // If given keys, sort the output into that order, and add entries for missing keys:
-        // TODO
+        if(options.getKeys() != null && options.getKeys().size() > 0){
+            // Group rows by key:
+            Map<Object, List<QueryRow>> rowsByKey = new HashMap<Object, List<QueryRow>>();
+            for(QueryRow row:rows){
+                List<QueryRow> rs = rowsByKey.get(row.getKey());
+                if(rs == null) {
+                    rs = new ArrayList<QueryRow>();
+                    rowsByKey.put(row.getKey(), rs);
+                }
+                rs.add(row);
+            }
+
+            // Now concatenate them in the order the keys are given in options:
+            final List<QueryRow> sortedRows = new ArrayList<QueryRow>();
+            for(Object key : options.getKeys()){
+                JsonDocument jsonDoc = null;
+                try {
+                    byte[] keyBytes = Manager.getObjectMapper().writeValueAsBytes(key);
+                    jsonDoc = new JsonDocument(keyBytes);
+                } catch (JsonProcessingException e) {
+                    throw new  CouchbaseLiteException(Status.INTERNAL_SERVER_ERROR);
+                }
+                List<QueryRow> rs = rowsByKey.get(jsonDoc.jsonObject());
+                if(rs != null)
+                    sortedRows.addAll(rs);
+            }
+
+            return sortedRows;
+        }
 
         return rows;
     }
@@ -645,34 +658,6 @@ public class SQLiteViewStore implements ViewStore, QueryRowStore {
     }
 
     @Override
-    public QueryRowStore storageForQueryRow(QueryRow row) {
-        // TODO: Implement
-        return null;
-    }
-
-    @Override
-    public int getViewID() {
-        if (viewID < 0) {
-            String sql = "SELECT view_id FROM views WHERE name=?";
-            String[] args = {name};
-            Cursor cursor = null;
-            try {
-                cursor = store.getStorageEngine().rawQuery(sql, args);
-                if (cursor.moveToNext()) {
-                    viewID = cursor.getInt(0);
-                }
-            } catch (SQLException e) {
-                Log.e(Log.TAG_VIEW, "Error getting view id", e);
-            } finally {
-                if (cursor != null) {
-                    cursor.close();
-                }
-            }
-        }
-        return viewID;
-    }
-
-    @Override
     public List<Map<String, Object>> dump() {
         if (getViewID() < 0)
             return null;
@@ -723,6 +708,27 @@ public class SQLiteViewStore implements ViewStore, QueryRowStore {
     // Internal (Private) Instance Methods
     ///////////////////////////////////////////////////////////////////////////
 
+    private int getViewID() {
+        if (viewID < 0) {
+            String sql = "SELECT view_id FROM views WHERE name=?";
+            String[] args = {name};
+            Cursor cursor = null;
+            try {
+                cursor = store.getStorageEngine().rawQuery(sql, args);
+                if (cursor.moveToNext()) {
+                    viewID = cursor.getInt(0);
+                }
+            } catch (SQLException e) {
+                Log.e(Log.TAG_VIEW, "Error getting view id", e);
+            } finally {
+                if (cursor != null) {
+                    cursor.close();
+                }
+            }
+        }
+        return viewID;
+    }
+
     // pragma mark - QUERYING:
 
     /**
@@ -768,7 +774,7 @@ public class SQLiteViewStore implements ViewStore, QueryRowStore {
         String minKeyDocId = options.getStartKeyDocId();
         String maxKeyDocId = options.getEndKeyDocId();
 
-        boolean inclusiveMin = true;
+        boolean inclusiveMin = options.isInclusiveStart();
         boolean inclusiveMax = options.isInclusiveEnd();
         if (options.isDescending()) {
             Object min = minKey;
@@ -903,7 +909,7 @@ public class SQLiteViewStore implements ViewStore, QueryRowStore {
                 "key TEXT NOT NULL COLLATE JSON," +
                 "value TEXT)";
         if (!runStatements(sql))
-            Log.w(TAG, "Couldn't create view index `%s`", name);
+            Log.w(TAG, "Couldn't create view _index `%s`", name);
     }
 
 
