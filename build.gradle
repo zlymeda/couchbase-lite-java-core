@@ -51,7 +51,7 @@ task uploadArchivesWrapper(dependsOn: createMavenDirectory) << {
 uploadArchives {
     repositories {
         mavenDeployer {
-            repository(url: System.getenv("MAVEN_UPLOAD_REPO_URL"))
+            repository(url: System.getProperty("MAVEN_UPLOAD_REPO_URL"))
             pom.version = version
             pom.groupId = 'zlymeda'
             pom.artifactId = 'couchbase-lite-java-core'
